@@ -1130,20 +1130,33 @@ jobs:
           go run -v ./cmd/internal/update_desktop_version --ci --nightly
       - name: Setup signing
         run: |-
-          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_CERTIFICATES_P12) -or [string]::IsNullOrWhiteSpace($env:WINDOWS_P12_PASSWORD)) {
-            Write-Warning "Windows signing secrets are unavailable; SFW installers will be self-built and unsigned."
-            $builderConfig = "clients/desktop/electron-builder.yml"
-            $content = Get-Content -Raw $builderConfig
-            $content = $content -replace '(?m)^  forceCodeSigning: true$', '  forceCodeSigning: false'
-            Set-Content -Path $builderConfig -Value $content -Encoding utf8NoBOM
-            exit 0
-          }
           $certificatePath = Join-Path $env:RUNNER_TEMP "windows-signing.p12"
-          [IO.File]::WriteAllBytes($certificatePath, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATES_P12))
+          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_CERTIFICATES_P12) -or [string]::IsNullOrWhiteSpace($env:WINDOWS_P12_PASSWORD)) {
+            Write-Warning "Windows signing secrets are unavailable; SFW installers will use an ephemeral self-signed certificate."
+            $certificatePassword = [Guid]::NewGuid().ToString("N")
+            $securePassword = ConvertTo-SecureString $certificatePassword -AsPlainText -Force
+            $certificate = New-SelfSignedCertificate `
+              -Type CodeSigningCert `
+              -Subject "CN=sing-box fork build" `
+              -FriendlyName "sing-box fork build ($env:GITHUB_REPOSITORY)" `
+              -CertStoreLocation "Cert:\CurrentUser\My" `
+              -KeyAlgorithm RSA `
+              -KeyLength 3072 `
+              -HashAlgorithm SHA256 `
+              -KeyExportPolicy Exportable `
+              -NotAfter (Get-Date).AddYears(10)
+            Export-PfxCertificate `
+              -Cert $certificate `
+              -FilePath $certificatePath `
+              -Password $securePassword | Out-Null
+          } else {
+            $certificatePassword = $env:WINDOWS_P12_PASSWORD
+            [IO.File]::WriteAllBytes($certificatePath, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATES_P12))
+          }
           @{
             windows = @{
               certificateFile = $certificatePath
-              certificatePassword = $env:WINDOWS_P12_PASSWORD
+              certificatePassword = $certificatePassword
             }
           } | ConvertTo-Json -Depth 3 | Set-Content -Encoding utf8NoBOM clients/desktop/signing.local.json
         env:
