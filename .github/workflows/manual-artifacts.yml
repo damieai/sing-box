@@ -1,0 +1,259 @@
+name: Manual Build Installable Artifacts
+
+run-name: Build ${{ inputs.source_ref || inputs.channel }} for ${{ inputs.target }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: "Source channel (stable = release, testing = test)"
+        required: true
+        type: choice
+        default: testing
+        options:
+          - stable
+          - testing
+          - unstable
+      source_ref:
+        description: "Optional branch, tag, or commit SHA (overrides channel)"
+        required: false
+        type: string
+      target:
+        description: "Artifacts to build"
+        required: true
+        type: choice
+        default: Linux
+        options:
+          - Linux
+          - Windows
+          - macOS
+          - All
+
+permissions:
+  contents: read
+
+concurrency:
+  group: manual-artifacts-${{ inputs.source_ref || inputs.channel }}-${{ inputs.target }}
+  cancel-in-progress: false
+
+jobs:
+  resolve_source:
+    name: Resolve source commit
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.metadata.outputs.sha }}
+      short_sha: ${{ steps.metadata.outputs.short_sha }}
+      source_ref: ${{ steps.metadata.outputs.source_ref }}
+      version: ${{ steps.metadata.outputs.version }}
+      package_name: ${{ steps.metadata.outputs.package_name }}
+      matrix: ${{ steps.metadata.outputs.matrix }}
+    steps:
+      - name: Checkout selected source
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
+        with:
+          ref: ${{ inputs.source_ref || inputs.channel }}
+          fetch-depth: 0
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 1.26.6
+          cache: false
+      - name: Resolve build metadata
+        id: metadata
+        shell: bash
+        env:
+          CHANNEL: ${{ inputs.channel }}
+          REQUESTED_REF: ${{ inputs.source_ref }}
+          TARGET: ${{ inputs.target }}
+        run: |-
+          set -euo pipefail
+
+          source_ref="${REQUESTED_REF:-$CHANNEL}"
+          sha=$(git rev-parse HEAD)
+          short_sha=$(git rev-parse --short=9 HEAD)
+          version=$(go run ./cmd/internal/read_tag)
+
+          case "$CHANNEL" in
+            stable) package_name=sing-box ;;
+            testing) package_name=sing-box-testing ;;
+            unstable) package_name=sing-box-unstable ;;
+          esac
+          if [[ -n "$REQUESTED_REF" ]]; then
+            package_name=sing-box-custom
+          fi
+
+          matrix=$(jq -cn --arg target "$TARGET" '
+            [
+              {family: "Linux", artifact_target: "linux-amd64", goos: "linux", goarch: "amd64", deb_arch: "amd64"},
+              {family: "Linux", artifact_target: "linux-arm64", goos: "linux", goarch: "arm64", deb_arch: "arm64"},
+              {family: "Linux", artifact_target: "linux-386", goos: "linux", goarch: "386", deb_arch: "i386"},
+              {family: "Linux", artifact_target: "linux-armv7", goos: "linux", goarch: "arm", goarm: "7", deb_arch: "armhf"},
+              {family: "Windows", artifact_target: "windows-amd64", goos: "windows", goarch: "amd64"},
+              {family: "Windows", artifact_target: "windows-arm64", goos: "windows", goarch: "arm64"},
+              {family: "Windows", artifact_target: "windows-386", goos: "windows", goarch: "386"},
+              {family: "macOS", artifact_target: "darwin-amd64", goos: "darwin", goarch: "amd64"},
+              {family: "macOS", artifact_target: "darwin-arm64", goos: "darwin", goarch: "arm64"}
+            ]
+            | {include: map(select($target == "All" or .family == $target))}
+          ')
+
+          {
+            echo "sha=$sha"
+            echo "short_sha=$short_sha"
+            echo "source_ref=$source_ref"
+            echo "version=$version"
+            echo "package_name=$package_name"
+            echo "matrix=$matrix"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## Manual source build"
+            echo
+            echo "- Repository: \`$GITHUB_REPOSITORY\`"
+            echo "- Requested ref: \`$source_ref\`"
+            echo "- Resolved commit: \`$sha\`"
+            echo "- Embedded version: \`$version\`"
+            echo "- Target group: \`${{ inputs.target }}\`"
+            echo
+            echo "Every artifact below is compiled from this commit; no upstream binary is downloaded."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: Build ${{ matrix.artifact_target }}
+    needs: resolve_source
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.resolve_source.outputs.matrix) }}
+    steps:
+      - name: Checkout resolved commit
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
+        with:
+          ref: ${{ needs.resolve_source.outputs.sha }}
+          fetch-depth: 1
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 1.26.6
+          cache: true
+      - name: Build from source
+        shell: bash
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          VERSION: ${{ needs.resolve_source.outputs.version }}
+        run: |-
+          set -euo pipefail
+
+          build_tags=$(tr -d '\r\n' < release/DEFAULT_BUILD_TAGS_OTHERS)
+          ldflags_shared=$(tr -d '\r\n' < release/LDFLAGS)
+          output=sing-box
+          if [[ "$GOOS" == windows ]]; then
+            output=sing-box.exe
+          fi
+
+          mkdir -p build
+          go build -v -trimpath \
+            -tags "$build_tags" \
+            -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=$VERSION' $ldflags_shared -s -w -buildid=" \
+            -o "build/$output" \
+            ./cmd/sing-box
+      - name: Package artifact
+        shell: bash
+        env:
+          ARTIFACT_TARGET: ${{ matrix.artifact_target }}
+          DEB_ARCH: ${{ matrix.deb_arch }}
+          GOOS: ${{ matrix.goos }}
+          PACKAGE_NAME: ${{ needs.resolve_source.outputs.package_name }}
+          SOURCE_REF: ${{ needs.resolve_source.outputs.source_ref }}
+          SOURCE_SHA: ${{ needs.resolve_source.outputs.sha }}
+          VERSION: ${{ needs.resolve_source.outputs.version }}
+        run: |-
+          set -euo pipefail
+
+          archive_name="sing-box-${VERSION}-${ARTIFACT_TARGET}"
+          stage="$RUNNER_TEMP/$archive_name"
+          mkdir -p "$stage" dist
+          cp LICENSE "$stage/"
+          if [[ "$GOOS" == windows ]]; then
+            cp build/sing-box.exe "$stage/"
+          else
+            cp build/sing-box "$stage/"
+          fi
+
+          jq -n \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg ref "$SOURCE_REF" \
+            --arg commit "$SOURCE_SHA" \
+            --arg version "$VERSION" \
+            --arg target "$ARTIFACT_TARGET" \
+            '{repository: $repository, ref: $ref, commit: $commit, version: $version, target: $target}' \
+            > "$stage/build-info.json"
+
+          if [[ "$GOOS" == windows ]]; then
+            (cd "$RUNNER_TEMP" && zip -q -r "$GITHUB_WORKSPACE/dist/${archive_name}.zip" "$archive_name")
+          else
+            tar -C "$RUNNER_TEMP" -czf "dist/${archive_name}.tar.gz" "$archive_name"
+          fi
+
+          if [[ "$GOOS" == linux ]]; then
+            deb_root="$RUNNER_TEMP/deb-root"
+            pkg_version=${VERSION//-/\~}
+            install -Dm755 build/sing-box "$deb_root/usr/bin/sing-box"
+            install -Dm644 LICENSE "$deb_root/usr/share/licenses/$PACKAGE_NAME/LICENSE"
+            install -Dm644 "$stage/build-info.json" "$deb_root/usr/share/doc/$PACKAGE_NAME/build-info.json"
+            install -Dm644 release/config/config.json "$deb_root/etc/sing-box/config.json"
+            install -Dm644 release/config/sing-box.service "$deb_root/usr/lib/systemd/system/sing-box.service"
+            install -Dm644 release/config/sing-box@.service "$deb_root/usr/lib/systemd/system/sing-box@.service"
+            install -Dm644 release/config/sing-box.sysusers "$deb_root/usr/lib/sysusers.d/sing-box.conf"
+            install -Dm644 release/completions/sing-box.bash "$deb_root/usr/share/bash-completion/completions/sing-box"
+            install -Dm644 release/completions/sing-box.fish "$deb_root/usr/share/fish/vendor_completions.d/sing-box.fish"
+            install -Dm644 release/completions/sing-box.zsh "$deb_root/usr/share/zsh/site-functions/_sing-box"
+            install -d "$deb_root/DEBIAN"
+            echo '/etc/sing-box/config.json' > "$deb_root/DEBIAN/conffiles"
+            cat > "$deb_root/DEBIAN/postinst" <<'POSTINST'
+          #!/bin/sh
+          set -e
+          if command -v systemd-sysusers >/dev/null 2>&1; then
+            systemd-sysusers sing-box.conf || true
+          fi
+          if command -v systemctl >/dev/null 2>&1; then
+            systemctl daemon-reload || true
+          fi
+          POSTINST
+            chmod 0755 "$deb_root/DEBIAN/postinst"
+            {
+              echo "Package: $PACKAGE_NAME"
+              echo "Version: $pkg_version"
+              echo "Section: net"
+              echo "Priority: optional"
+              echo "Architecture: $DEB_ARCH"
+              echo "Maintainer: $GITHUB_REPOSITORY_OWNER"
+              echo "Depends: ca-certificates"
+              echo "Description: sing-box built from $SOURCE_SHA"
+            } > "$deb_root/DEBIAN/control"
+            dpkg-deb --root-owner-group --build \
+              "$deb_root" \
+              "dist/${PACKAGE_NAME}_${VERSION}_linux_${DEB_ARCH}.deb"
+          fi
+
+          mapfile -t files < <(find dist -maxdepth 1 -type f -printf '%f\n' | sort)
+          (cd dist && sha256sum "${files[@]}") > "dist/SHA256SUMS-${ARTIFACT_TARGET}"
+      - name: Verify built binary
+        if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
+        shell: bash
+        run: |-
+          set -euo pipefail
+          actual=$(build/sing-box version)
+          echo "$actual"
+          grep -F '${{ needs.resolve_source.outputs.version }}' <<< "$actual"
+      - name: Upload installable artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sing-box-${{ needs.resolve_source.outputs.version }}-${{ needs.resolve_source.outputs.short_sha }}-${{ matrix.artifact_target }}
+          path: dist
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
