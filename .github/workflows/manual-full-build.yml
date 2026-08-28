@@ -1,23 +1,18 @@
-name: Manual Full Release Build
+name: Manual Stable / Testing Build
 
-run-name: Build ${{ inputs.custom_ref || inputs.channel }} / ${{ inputs.build }}
+run-name: Build ${{ inputs.release_track }} / ${{ inputs.build }}
 
 on:
   workflow_dispatch:
     inputs:
-      channel:
-        description: "Source channel (stable = release, testing = test)"
+      release_track:
+        description: "Release track (source and client branches are validated together)"
         required: true
         type: choice
         default: testing
         options:
           - stable
           - testing
-          - unstable
-      custom_ref:
-        description: "Optional branch, tag, or commit SHA (overrides channel)"
-        required: false
-        type: string
       build:
         description: "Build type"
         required: true
@@ -36,14 +31,13 @@ on:
           - tvOS
           - macOS-standalone
           - iOS-jailbreak
-          - publish-android
       test_message:
         description: "TestFlight test message"
         required: false
         type: string
 
 concurrency:
-  group: full-release-${{ inputs.custom_ref || inputs.channel }}-${{ inputs.build }}
+  group: manual-release-${{ inputs.release_track }}-${{ inputs.build }}
   cancel-in-progress: true
 
 jobs:
@@ -52,37 +46,28 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.outputs.outputs.version }}
+      release_tag: ${{ steps.outputs.outputs.release_tag }}
       sha: ${{ steps.outputs.outputs.sha }}
       short_sha: ${{ steps.outputs.outputs.short_sha }}
-      channel: ${{ steps.outputs.outputs.channel }}
+      track: ${{ steps.outputs.outputs.track }}
+      go_version: ${{ steps.outputs.outputs.go_version }}
+      android_ref: ${{ steps.outputs.outputs.android_ref }}
+      android_sha: ${{ steps.outputs.outputs.android_sha }}
+      android_version: ${{ steps.outputs.outputs.android_version }}
+      desktop_ref: ${{ steps.outputs.outputs.desktop_ref }}
+      desktop_sha: ${{ steps.outputs.outputs.desktop_sha }}
+      desktop_version: ${{ steps.outputs.outputs.desktop_version }}
+      apple_ref: ${{ steps.outputs.outputs.apple_ref }}
+      apple_sha: ${{ steps.outputs.outputs.apple_sha }}
+      apple_version: ${{ steps.outputs.outputs.apple_version }}
       apple_signing: ${{ steps.outputs.outputs.apple_signing }}
     steps:
       - name: Checkout
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
         with:
-          ref: ${{ inputs.custom_ref || inputs.channel }}
+          ref: ${{ inputs.release_track }}
           fetch-depth: 0
-      - name: Setup Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: 1.26.6
-          cache: false
-      - name: Cache Go modules
-        uses: actions/cache/restore@v4
-        with:
-          path: ~/go/pkg/mod
-          key: go-mod-linux-${{ hashFiles('go.sum') }}
-          restore-keys: go-mod-linux-
-      - name: Cache Go tool builds
-        uses: actions/cache/restore@v4
-        with:
-          path: ~/.cache/go-build
-          key: go-build-tools-linux-${{ hashFiles('go.sum') }}
-          restore-keys: go-build-tools-linux-
-      - name: Calculate version
-        run: |-
-          go run -v ./cmd/internal/read_tag --ci --nightly
-      - name: Set outputs
+      - name: Resolve and validate release track
         id: outputs
         env:
           APPLE_DEVELOPMENT_CERTIFICATES_P12: ${{ secrets.APPLE_DEVELOPMENT_CERTIFICATES_P12 }}
@@ -94,10 +79,95 @@ jobs:
           DEVELOPER_ID_CERTIFICATES_P12: ${{ secrets.DEVELOPER_ID_CERTIFICATES_P12 }}
           DEVELOPER_ID_P12_PASSWORD: ${{ secrets.DEVELOPER_ID_P12_PASSWORD }}
           REQUESTED_BUILD: ${{ inputs.build }}
+          RELEASE_TRACK: ${{ inputs.release_track }}
         run: |-
           set -euo pipefail
           sha=$(git rev-parse HEAD)
           short_sha=$(git rev-parse --short=9 HEAD)
+          changelog_version=$(sed -nE 's/^#### ([0-9]+\.[0-9]+\.[0-9]+[^ ]*)$/\1/p' docs/changelog.md | head -n 1)
+          if [[ -z "$changelog_version" ]]; then
+            echo "Unable to determine the release series from docs/changelog.md." >&2
+            exit 1
+          fi
+
+          git submodule update --init clients/android clients/apple
+          if [[ "$RELEASE_TRACK" == stable ]]; then
+            android_ref=main
+            apple_ref=main
+            desktop_ref=
+          else
+            android_ref=dev
+            apple_ref=dev
+            desktop_ref=main
+            git submodule update --init clients/desktop
+          fi
+
+          git -C clients/android fetch --depth=1 origin "$android_ref"
+          android_sha=$(git -C clients/android rev-parse FETCH_HEAD)
+          android_metadata=$(git -C clients/android show "${android_sha}:version.properties")
+          android_version=$(sed -n 's/^VERSION_NAME=//p' <<< "$android_metadata")
+          android_go_version=$(sed -n 's/^GO_VERSION=go//p' <<< "$android_metadata")
+
+          git -C clients/apple fetch --depth=1 origin "$apple_ref"
+          apple_sha=$(git -C clients/apple rev-parse FETCH_HEAD)
+          apple_project=$(git -C clients/apple show "${apple_sha}:sing-box.xcodeproj/project.pbxproj")
+
+          desktop_sha=
+          desktop_version=
+          desktop_go_version=
+          if [[ "$RELEASE_TRACK" == testing ]]; then
+            git -C clients/desktop fetch --depth=1 origin "$desktop_ref"
+            desktop_sha=$(git -C clients/desktop rev-parse FETCH_HEAD)
+            desktop_metadata=$(git -C clients/desktop show "${desktop_sha}:version.json")
+            desktop_version=$(jq -r '.version' <<< "$desktop_metadata")
+            desktop_go_version=$(jq -r '.go_version | sub("^go"; "")' <<< "$desktop_metadata")
+          fi
+
+          if [[ -z "$android_version" || -z "$android_go_version" ]]; then
+            echo "Android $android_ref has incomplete version metadata." >&2
+            exit 1
+          fi
+          if [[ "$android_version" != "$changelog_version" ]]; then
+            echo "Release-track mismatch: changelog=$changelog_version, Android $android_ref=$android_version." >&2
+            exit 1
+          fi
+          if ! grep -Fq "MARKETING_VERSION = $android_version;" <<< "$apple_project" &&
+             ! grep -Fq "MARKETING_VERSION = \"$android_version\";" <<< "$apple_project"; then
+            echo "Release-track mismatch: Apple $apple_ref does not contain MARKETING_VERSION=$android_version." >&2
+            exit 1
+          fi
+          apple_version=$android_version
+
+          if [[ "$RELEASE_TRACK" == stable ]]; then
+            if [[ ! "$android_version" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+              echo "Stable client version must be a final semantic version, got $android_version." >&2
+              exit 1
+            fi
+            version=$android_version
+            go_version=$android_go_version
+          else
+            if [[ "$desktop_version" != "$android_version" ]]; then
+              echo "Testing clients disagree: Android dev=$android_version, Desktop main=$desktop_version." >&2
+              exit 1
+            fi
+            if [[ "$desktop_go_version" != "$android_go_version" ]]; then
+              echo "Testing clients require different Go versions: Android=$android_go_version, Desktop=$desktop_go_version." >&2
+              exit 1
+            fi
+            if [[ "$android_version" != *-* ]]; then
+              echo "Testing client version must be a prerelease, got $android_version; upstream track mapping changed." >&2
+              exit 1
+            fi
+            version=$android_version
+            go_version=$android_go_version
+          fi
+          release_tag="build-${RELEASE_TRACK}-g${short_sha}"
+
+          if [[ "$RELEASE_TRACK" == stable && ("$REQUESTED_BUILD" == Windows || "$REQUESTED_BUILD" == Linux || "$REQUESTED_BUILD" == iOS-jailbreak) ]]; then
+            echo "The selected stable source does not support this build group. Use Binary for core Windows/Linux archives; SFW, SFL, and SFI jailbreak packages are testing-only." >&2
+            exit 1
+          fi
+
           apple_signing=false
           if [[ -n "$APPLE_DEVELOPMENT_CERTIFICATES_P12" &&
                 -n "$APPLE_DEVELOPMENT_P12_PASSWORD" &&
@@ -115,22 +185,81 @@ jobs:
           fi
           {
             echo "version=$version"
+            echo "release_tag=$release_tag"
             echo "sha=$sha"
             echo "short_sha=$short_sha"
-            echo "channel=${{ inputs.channel }}"
+            echo "track=$RELEASE_TRACK"
+            echo "go_version=$go_version"
+            echo "android_ref=$android_ref"
+            echo "android_sha=$android_sha"
+            echo "android_version=$android_version"
+            echo "desktop_ref=$desktop_ref"
+            echo "desktop_sha=$desktop_sha"
+            echo "desktop_version=$desktop_version"
+            echo "apple_ref=$apple_ref"
+            echo "apple_sha=$apple_sha"
+            echo "apple_version=$apple_version"
             echo "apple_signing=$apple_signing"
           } >> "$GITHUB_OUTPUT"
+
+          mkdir -p dist
+          jq -n \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg track "$RELEASE_TRACK" \
+            --arg version "$version" \
+            --arg release_tag "$release_tag" \
+            --arg source_ref "$RELEASE_TRACK" \
+            --arg source_sha "$sha" \
+            --arg android_ref "$android_ref" \
+            --arg android_sha "$android_sha" \
+            --arg android_version "$android_version" \
+            --arg desktop_ref "$desktop_ref" \
+            --arg desktop_sha "$desktop_sha" \
+            --arg desktop_version "$desktop_version" \
+            --arg apple_ref "$apple_ref" \
+            --arg apple_sha "$apple_sha" \
+            --arg apple_version "$apple_version" \
+            --arg go_version "$go_version" \
+            '{
+              repository: $repository,
+              track: $track,
+              version: $version,
+              release_tag: $release_tag,
+              source: {ref: $source_ref, sha: $source_sha},
+              clients: {
+                android: {ref: $android_ref, sha: $android_sha, version: $android_version},
+                desktop: {ref: $desktop_ref, sha: $desktop_sha, version: $desktop_version},
+                apple: {ref: $apple_ref, sha: $apple_sha, version: $apple_version}
+              },
+              go_version: $go_version
+            }' > dist/build-source-manifest.json
+
           {
-            echo "## Full source release build"
+            echo "## Validated source build"
             echo
-            echo "- Source: \`${{ inputs.custom_ref || inputs.channel }}\`"
+            echo "- Track: \`$RELEASE_TRACK\`"
+            echo "- Source: \`$RELEASE_TRACK\`"
             echo "- Commit: \`$sha\`"
             echo "- Version: \`$version\`"
+            echo "- Self-build release: \`$release_tag\`"
+            echo "- Go: \`$go_version\`"
+            echo "- Android: \`$android_ref@$android_sha\` (\`$android_version\`)"
+            if [[ "$RELEASE_TRACK" == testing ]]; then
+              echo "- Desktop: \`$desktop_ref@$desktop_sha\` (\`$desktop_version\`)"
+            else
+              echo "- Desktop: not supported by this source track"
+            fi
+            echo "- Apple: \`$apple_ref@$apple_sha\` (\`$apple_version\`)"
             echo "- Build group: \`${{ inputs.build }}\`"
             echo "- Apple signed standalone packages: \`$apple_signing\`"
             echo
-            echo "All jobs compile from source at the resolved commit; no sing-box release binary is reused."
+            echo "The source and client release tracks were validated before compilation; no sing-box release binary is reused."
           } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload source manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-source-manifest
+          path: dist/build-source-manifest.json
   build:
     name: Build binary
     if: github.event_name != 'workflow_dispatch' || inputs.build == 'All' || inputs.build == 'Binary'
@@ -196,7 +325,7 @@ jobs:
         if: ${{ ! matrix.legacy_win7 }}
         uses: actions/setup-go@v5
         with:
-          go-version: 1.26.6
+          go-version: ${{ needs.calculate_version.outputs.go_version }}
           cache: false
       - name: Cache Go modules
         uses: actions/cache/restore@v4
@@ -211,7 +340,7 @@ jobs:
         with:
           path: |
             ~/go/go_win7
-          key: go_win7_1266
+          key: go_win7_${{ needs.calculate_version.outputs.track }}_${{ needs.calculate_version.outputs.go_version }}
       - name: Setup Go for Windows 7
         if: matrix.legacy_win7 && steps.cache-go-for-windows7.outputs.cache-hit != 'true'
         env:
@@ -565,7 +694,7 @@ jobs:
         if: ${{ ! matrix.legacy_osx }}
         uses: actions/setup-go@v5
         with:
-          go-version: 1.26.6
+          go-version: ${{ needs.calculate_version.outputs.go_version }}
           cache: false
       - name: Cache Go modules
         uses: actions/cache/restore@v4
@@ -580,7 +709,7 @@ jobs:
         with:
           path: |
             ~/go/go_osx
-          key: go_osx_1266
+          key: go_osx_${{ needs.calculate_version.outputs.track }}_${{ needs.calculate_version.outputs.go_version }}
       - name: Setup Go for macOS 10.13
         if: matrix.legacy_osx && steps.cache-go-for-macos1013.outputs.cache-hit != 'true'
         env:
@@ -665,7 +794,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: 1.26.6
+          go-version: ${{ needs.calculate_version.outputs.go_version }}
           cache: false
       - name: Cache Go modules
         uses: actions/cache@v4
@@ -748,7 +877,7 @@ jobs:
           path: "dist"
   build_android_library:
     name: Build Android library (${{ matrix.go_arch }})
-    if: (github.event_name != 'workflow_dispatch' || inputs.build == 'All' || inputs.build == 'Android' || inputs.build == 'publish-android') && github.ref != 'refs/heads/oldstable'
+    if: inputs.build == 'All' || inputs.build == 'Android'
     runs-on: ubuntu-latest
     needs:
       - calculate_version
@@ -769,7 +898,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: 1.26.6
+          go-version: ${{ needs.calculate_version.outputs.go_version }}
           cache: false
       - name: Cache Go modules
         uses: actions/cache@v4
@@ -808,7 +937,7 @@ jobs:
           compression-level: 0
   build_android:
     name: Build Android (${{ matrix.variant }})
-    if: (github.event_name != 'workflow_dispatch' || inputs.build == 'All' || inputs.build == 'Android') && github.ref != 'refs/heads/oldstable'
+    if: inputs.build == 'All' || inputs.build == 'Android'
     runs-on: ubuntu-latest
     needs:
       - calculate_version
@@ -834,7 +963,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: 1.26.6
+          go-version: ${{ needs.calculate_version.outputs.go_version }}
           cache: false
       - name: Cache Go modules
         uses: actions/cache/restore@v4
@@ -872,16 +1001,16 @@ jobs:
         run: |-
           go run ./cmd/internal/merge_aar -output libbox.aar libbox-inputs/*/libbox.aar
           go run ./cmd/internal/merge_aar -output libbox-legacy.aar libbox-inputs/*/libbox-legacy.aar
-      - name: Checkout main branch
-        if: needs.calculate_version.outputs.channel == 'stable'
+      - name: Checkout validated Android client
         run: |-
-          cd clients/android
-          git checkout main
-      - name: Checkout dev branch
-        if: needs.calculate_version.outputs.channel == 'testing'
-        run: |-
-          cd clients/android
-          git checkout dev
+          set -euo pipefail
+          client_ref="${{ needs.calculate_version.outputs.android_ref }}"
+          client_sha="${{ needs.calculate_version.outputs.android_sha }}"
+          git -C clients/android fetch --depth=1 origin "$client_ref"
+          if ! git -C clients/android cat-file -e "${client_sha}^{commit}"; then
+            git -C clients/android fetch --depth=1 origin "$client_sha"
+          fi
+          git -C clients/android checkout --detach "$client_sha"
       - name: Checkout submodule recursive
         run: |-
           cd clients/android
@@ -927,9 +1056,9 @@ jobs:
           fi
           echo "LOCAL_PROPERTIES=$local_properties" >> "$GITHUB_ENV"
           echo "Android signing mode: $signing_mode" >> "$GITHUB_STEP_SUMMARY"
-      - name: Update development build version
+      - name: Verify Android client version
         run: |-
-          go run -v ./cmd/internal/update_android_version --ci --nightly
+          go run -v ./cmd/internal/update_android_version --ci
       - name: Build
         run: |-
           mkdir -p clients/android/app/libs
@@ -956,109 +1085,9 @@ jobs:
         with:
           name: binary-android-apks-${{ matrix.variant }}
           path: 'dist'
-  publish_android:
-    name: Publish Android
-    if: inputs.build == 'publish-android' && (needs.calculate_version.outputs.channel == 'stable' || needs.calculate_version.outputs.channel == 'testing')
-    runs-on: ubuntu-latest
-    needs:
-      - calculate_version
-      - build_android_library
-    steps:
-      - name: Checkout
-        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
-        with:
-          ref: ${{ needs.calculate_version.outputs.sha }}
-          fetch-depth: 1
-      - name: Checkout Android client
-        run: git submodule update --init clients/android
-      - name: Setup Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: 1.26.6
-          cache: false
-      - name: Cache Go modules
-        uses: actions/cache/restore@v4
-        with:
-          path: ~/go/pkg/mod
-          key: go-mod-linux-${{ hashFiles('go.sum') }}
-          restore-keys: go-mod-linux-
-      - name: Cache Go tool builds
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/go-build
-          key: go-build-tools-linux-${{ hashFiles('go.sum') }}
-          restore-keys: go-build-tools-linux-
-      - name: Setup Android NDK
-        id: setup-ndk
-        uses: nttld/setup-ndk@v1
-        with:
-          ndk-version: r28
-      - name: Setup OpenJDK
-        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5.6.0
-        with:
-          distribution: temurin
-          java-version: 17
-      - name: Set tag
-        run: |-
-          git ls-remote --exit-code --tags origin v${{ needs.calculate_version.outputs.version }} || echo "PUBLISHED=false" >> "$GITHUB_ENV"
-          git tag v${{ needs.calculate_version.outputs.version }} -f
-      - name: Download libraries
-        uses: actions/download-artifact@v4
-        with:
-          pattern: libbox-android-*
-          path: libbox-inputs
-          merge-multiple: true
-      - name: Merge libraries
-        run: |-
-          go run ./cmd/internal/merge_aar -output libbox.aar libbox-inputs/*/libbox.aar
-          go run ./cmd/internal/merge_aar -output libbox-legacy.aar libbox-inputs/*/libbox-legacy.aar
-      - name: Checkout main branch
-        if: needs.calculate_version.outputs.channel == 'stable'
-        run: |-
-          cd clients/android
-          git checkout main
-      - name: Checkout dev branch
-        if: needs.calculate_version.outputs.channel == 'testing'
-        run: |-
-          cd clients/android
-          git checkout dev
-      - name: Checkout submodule recursive
-        run: |-
-          cd clients/android
-          git submodule update --init --recursive -v
-      - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@3f131e8634966bd73d06cc69884922b02e6faf92 # v6.2.0
-        with:
-          cache-provider: basic
-      - name: Prepare build
-        run: |-
-          go run -v ./cmd/internal/update_android_version --ci
-          mkdir -p clients/android/app/libs
-          cp *.aar clients/android/app/libs
-          cd clients/android
-          echo -n "$SERVICE_ACCOUNT_CREDENTIALS" | base64 --decode > service-account-credentials.json
-          chmod 600 service-account-credentials.json
-          jq -e '
-            .type == "service_account" and
-            (.project_id | type == "string" and length > 0) and
-            (.private_key | type == "string" and length > 0) and
-            (.client_email | type == "string" and length > 0) and
-            (.token_uri | type == "string" and length > 0)
-          ' service-account-credentials.json > /dev/null
-          jq -r '.private_key' service-account-credentials.json | openssl pkey -check -noout
-        env:
-          LOCAL_PROPERTIES: ${{ secrets.LOCAL_PROPERTIES }}
-          SERVICE_ACCOUNT_CREDENTIALS: ${{ secrets.SERVICE_ACCOUNT_CREDENTIALS }}
-      - name: Publish to Google Play
-        run: |-
-          cd clients/android
-          ./gradlew --build-cache --parallel :app:publishPlayReleaseBundle
-        env:
-          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
-          LOCAL_PROPERTIES: ${{ secrets.LOCAL_PROPERTIES }}
   build_windows_client:
     name: Build Windows client (${{ matrix.desktop_arch }})
-    if: (github.event_name != 'workflow_dispatch' || inputs.build == 'All' || inputs.build == 'Windows') && github.ref != 'refs/heads/oldstable'
+    if: needs.calculate_version.outputs.track == 'testing' && (inputs.build == 'All' || inputs.build == 'Windows')
     runs-on: windows-latest
     needs:
       - calculate_version
@@ -1077,15 +1106,23 @@ jobs:
           fetch-depth: 1
       - name: Checkout desktop client
         run: git submodule update --init clients/desktop
-      - name: Checkout main branch
-        if: needs.calculate_version.outputs.channel == 'testing'
-        run: git -C clients/desktop checkout main
+      - name: Checkout validated Desktop client
+        shell: pwsh
+        run: |-
+          $clientRef = "${{ needs.calculate_version.outputs.desktop_ref }}"
+          $clientSha = "${{ needs.calculate_version.outputs.desktop_sha }}"
+          git -C clients/desktop fetch --depth=1 origin $clientRef
+          git -C clients/desktop cat-file -e "$clientSha^{commit}"
+          if ($LASTEXITCODE -ne 0) {
+            git -C clients/desktop fetch --depth=1 origin $clientSha
+          }
+          git -C clients/desktop checkout --detach $clientSha
       - name: Checkout desktop submodules
         run: git -C clients/desktop submodule update --init --recursive
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: 1.26.6
+          go-version: ${{ needs.calculate_version.outputs.go_version }}
           cache: false
       - name: Cache Go modules
         uses: actions/cache@v4
@@ -1125,9 +1162,9 @@ jobs:
             "PUBLISHED=false" >> $env:GITHUB_ENV
           }
           git tag v${{ needs.calculate_version.outputs.version }} -f
-      - name: Update development build version
+      - name: Verify Desktop client version
         run: |-
-          go run -v ./cmd/internal/update_desktop_version --ci --nightly
+          go run -v ./cmd/internal/update_desktop_version --ci
       - name: Setup signing
         run: |-
           $certificatePath = Join-Path $env:RUNNER_TEMP "windows-signing.p12"
@@ -1185,7 +1222,7 @@ jobs:
           path: 'dist'
   build_linux_client:
     name: Build Linux client (${{ matrix.desktop_arch }})
-    if: (github.event_name != 'workflow_dispatch' || inputs.build == 'All' || inputs.build == 'Linux') && github.ref != 'refs/heads/oldstable'
+    if: needs.calculate_version.outputs.track == 'testing' && (inputs.build == 'All' || inputs.build == 'Linux')
     runs-on: ubuntu-26.04
     needs:
       - calculate_version
@@ -1203,15 +1240,22 @@ jobs:
           fetch-depth: 1
       - name: Checkout desktop client
         run: git submodule update --init clients/desktop
-      - name: Checkout main branch
-        if: needs.calculate_version.outputs.channel == 'testing'
-        run: git -C clients/desktop checkout main
+      - name: Checkout validated Desktop client
+        run: |-
+          set -euo pipefail
+          client_ref="${{ needs.calculate_version.outputs.desktop_ref }}"
+          client_sha="${{ needs.calculate_version.outputs.desktop_sha }}"
+          git -C clients/desktop fetch --depth=1 origin "$client_ref"
+          if ! git -C clients/desktop cat-file -e "${client_sha}^{commit}"; then
+            git -C clients/desktop fetch --depth=1 origin "$client_sha"
+          fi
+          git -C clients/desktop checkout --detach "$client_sha"
       - name: Checkout desktop submodules
         run: git -C clients/desktop submodule update --init --recursive
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: 1.26.6
+          go-version: ${{ needs.calculate_version.outputs.go_version }}
           cache: false
       - name: Cache Go modules
         uses: actions/cache@v4
@@ -1235,9 +1279,9 @@ jobs:
         run: |-
           git ls-remote --exit-code --tags origin v${{ needs.calculate_version.outputs.version }} || echo "PUBLISHED=false" >> "$GITHUB_ENV"
           git tag v${{ needs.calculate_version.outputs.version }} -f
-      - name: Update development build version
+      - name: Verify Desktop client version
         run: |-
-          go run -v ./cmd/internal/update_desktop_version --ci --nightly
+          go run -v ./cmd/internal/update_desktop_version --ci
       - name: Clone cronet-go
         run: |-
           set -xeuo pipefail
@@ -1372,7 +1416,7 @@ jobs:
         if: matrix.build
         uses: actions/setup-go@v5
         with:
-          go-version: 1.26.6
+          go-version: ${{ needs.calculate_version.outputs.go_version }}
           cache: false
       - name: Cache Go modules
         if: matrix.build
@@ -1386,8 +1430,8 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/Library/Caches/go-build
-          key: libbox-go-build-${{ matrix.artifact }}-1.26.6-${{ hashFiles('go.sum') }}
-          restore-keys: libbox-go-build-${{ matrix.artifact }}-1.26.6-
+          key: libbox-go-build-${{ matrix.artifact }}-${{ needs.calculate_version.outputs.go_version }}-${{ hashFiles('go.sum') }}
+          restore-keys: libbox-go-build-${{ matrix.artifact }}-${{ needs.calculate_version.outputs.go_version }}-
       - name: Set tag
         if: matrix.build
         run: git tag v${{ needs.calculate_version.outputs.version }} -f
@@ -1430,7 +1474,7 @@ jobs:
             upload_extension: ''
             altool_platform: ''
           - name: iOS-jailbreak
-            if: ${{ github.event_name != 'workflow_dispatch' || inputs.build == 'All' || inputs.build == 'Apple-release' || inputs.build == 'iOS-jailbreak' }}
+            if: ${{ needs.calculate_version.outputs.track == 'testing' && (inputs.build == 'All' || inputs.build == 'Apple-release' || inputs.build == 'iOS-jailbreak') }}
             type: jailbreak
             platform: ios
             variant: ''
@@ -1455,7 +1499,7 @@ jobs:
         if: matrix.if
         uses: actions/setup-go@v5
         with:
-          go-version: 1.26.6
+          go-version: ${{ needs.calculate_version.outputs.go_version }}
           cache: false
       - name: Cache Go modules
         if: matrix.if
@@ -1477,16 +1521,17 @@ jobs:
           git ls-remote --exit-code --tags origin v${{ needs.calculate_version.outputs.version }} || echo "PUBLISHED=false" >> "$GITHUB_ENV"
           git tag v${{ needs.calculate_version.outputs.version }} -f
           echo "VERSION=${{ needs.calculate_version.outputs.version }}" >> "$GITHUB_ENV"
-      - name: Checkout main branch
-        if: matrix.if && needs.calculate_version.outputs.channel == 'stable'
+      - name: Checkout validated Apple client
+        if: matrix.if
         run: |-
-          cd clients/apple
-          git checkout main
-      - name: Checkout dev branch
-        if: matrix.if && needs.calculate_version.outputs.channel == 'testing'
-        run: |-
-          cd clients/apple
-          git checkout dev
+          set -euo pipefail
+          client_ref="${{ needs.calculate_version.outputs.apple_ref }}"
+          client_sha="${{ needs.calculate_version.outputs.apple_sha }}"
+          git -C clients/apple fetch --depth=1 origin "$client_ref"
+          if ! git -C clients/apple cat-file -e "${client_sha}^{commit}"; then
+            git -C clients/apple fetch --depth=1 origin "$client_sha"
+          fi
+          git -C clients/apple checkout --detach "$client_sha"
       - name: Cache Swift packages
         if: matrix.if
         uses: actions/cache@v4
@@ -1683,7 +1728,7 @@ jobs:
             --api-key $ASC_KEY_ID \
             --api-issuer 00000000-0000-0000-0000-000000000000
       - name: Publish to TestFlight
-        if: matrix.if && matrix.type == 'app-store' && needs.calculate_version.outputs.channel == 'testing'
+        if: matrix.if && matrix.type == 'app-store' && needs.calculate_version.outputs.track == 'testing'
         run: |-
           arguments=(publish_testflight "${{ matrix.platform }}")
           if [[ -n "$TEST_MESSAGE" ]]; then
@@ -1788,7 +1833,7 @@ jobs:
     steps: *build_apple_steps
   upload:
     name: Upload builds
-    if: "!failure() && github.event_name == 'workflow_dispatch' && (inputs.build == 'All' || inputs.build == 'Binary' || inputs.build == 'Android' || inputs.build == 'Windows' || inputs.build == 'Linux' || inputs.build == 'Apple-release' || inputs.build == 'macOS-standalone' || inputs.build == 'iOS-jailbreak')"
+    if: "always() && !cancelled() && !failure() && (inputs.build == 'All' || inputs.build == 'Binary' || inputs.build == 'Android' || inputs.build == 'Windows' || inputs.build == 'Linux' || inputs.build == 'Apple-release' || inputs.build == 'macOS-standalone' || inputs.build == 'iOS-jailbreak')"
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -1830,19 +1875,55 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |-
-          if gh release view "v${{ needs.calculate_version.outputs.version }}" > /dev/null 2>&1; then
+          release_tag="${{ needs.calculate_version.outputs.release_tag }}"
+          if gh release view "$release_tag" > /dev/null 2>&1; then
             echo "PUBLISHED=true" >> "$GITHUB_ENV"
           else
             echo "PUBLISHED=false" >> "$GITHUB_ENV"
           fi
-          git tag v${{ needs.calculate_version.outputs.version }} -f
+          git tag "$release_tag" -f
           echo "VERSION=${{ needs.calculate_version.outputs.version }}" >> "$GITHUB_ENV"
+          echo "RELEASE_TAG=$release_tag" >> "$GITHUB_ENV"
       - name: Download builds
         uses: actions/download-artifact@v5
         with:
           pattern: binary-*
           path: dist
           merge-multiple: true
+      - name: Mark self-built asset filenames
+        env:
+          RELEASE_TRACK: ${{ needs.calculate_version.outputs.track }}
+          SHORT_SHA: ${{ needs.calculate_version.outputs.short_sha }}
+        run: |-
+          set -euo pipefail
+          suffix="-selfbuild-${RELEASE_TRACK}-g${SHORT_SHA}"
+          for path in dist/*; do
+            [[ -f "$path" ]] || continue
+            filename=$(basename "$path")
+            if [[ "$filename" == build-source-manifest.json ]]; then
+              continue
+            fi
+            case "$filename" in
+              *.pkg.tar.zst)
+                stem=${filename%.pkg.tar.zst}
+                extension=.pkg.tar.zst
+                ;;
+              *.tar.gz)
+                stem=${filename%.tar.gz}
+                extension=.tar.gz
+                ;;
+              *)
+                if [[ "$filename" == *.* ]]; then
+                  stem=${filename%.*}
+                  extension=.${filename##*.}
+                else
+                  stem=$filename
+                  extension=
+                fi
+                ;;
+            esac
+            mv "$path" "dist/${stem}${suffix}${extension}"
+          done
       - name: Attest build provenance
         uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
         with:
@@ -1851,14 +1932,14 @@ jobs:
         if: ${{ env.PUBLISHED == 'false' }}
         run: |-
           export PATH="$PATH:$HOME/go/bin"
-          ghr --replace --draft --prerelease -c "${{ needs.calculate_version.outputs.sha }}" -p 5 "v${VERSION}" dist
+          ghr --replace --draft --prerelease -c "${{ needs.calculate_version.outputs.sha }}" -p 5 "$RELEASE_TAG" dist
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Replace builds
         if: ${{ env.PUBLISHED != 'false' }}
         run: |-
           export PATH="$PATH:$HOME/go/bin"
-          ghr --replace -c "${{ needs.calculate_version.outputs.sha }}" -p 5 "v${VERSION}" dist
+          ghr --replace -c "${{ needs.calculate_version.outputs.sha }}" -p 5 "$RELEASE_TAG" dist
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
   cache_gc:
